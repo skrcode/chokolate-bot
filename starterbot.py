@@ -1,70 +1,142 @@
 import os
 import time
-import re
 from slackclient import SlackClient
+import json
+import socket
+import csv
 
-
-# instantiate Slack client
-slack_client = SlackClient(os.environ.get('SLACK_BOT_TOKEN'))
-# starterbot's user ID in Slack: value is assigned after the bot starts up
-starterbot_id = None
+# starterbot's ID as an environment variable
+BOT_ID = os.environ.get("BOT_ID")
 
 # constants
-RTM_READ_DELAY = 1 # 1 second delay between reading from RTM
-EXAMPLE_COMMAND = "do"
-MENTION_REGEX = "^<@(|[WU].+?)>(.*)"
+AT_BOT = "<@" + BOT_ID + ">"
+EXAMPLE_COMMAND_GOT = "camelateforstanduptoday"
+EXAMPLE_COMMAND_GAVE = "gavechocolates"
+EXAMPLE_COMMAND_EXCUSED = "goeasyon"
+EXAMPLE_COMMAND_NOTEXCUSED = "immunityoverfor"
+EXAMPLE_PUNISHMENT = "havenotyetbroughtchocolates"
+# instantiate Slack & Twilio clients
+slack_client = SlackClient(os.environ.get('SLACK_BOT_TOKEN'))
 
-def parse_bot_commands(slack_events):
-    """
-        Parses a list of events coming from the Slack RTM API to find bot commands.
-        If a bot command is found, this function returns a tuple of command and channel.
-        If its not found, then this function returns None, None.
-    """
-    for event in slack_events:
-        if event["type"] == "message" and not "subtype" in event:
-            user_id, message = parse_direct_mention(event["text"])
-            if user_id == starterbot_id:
-                return message, event["channel"]
-    return None, None
-
-def parse_direct_mention(message_text):
-    """
-        Finds a direct mention (a mention that is at the beginning) in message text
-        and returns the user ID which was mentioned. If there is no direct mention, returns None
-    """
-    matches = re.search(MENTION_REGEX, message_text)
-    # the first group contains the username, the second group contains the remaining message
-    return (matches.group(1), matches.group(2).strip()) if matches else (None, None)
-
+count = dict()
+isExcused = dict()
 def handle_command(command, channel):
     """
-        Executes bot command if the command is known
+        Receives commands directed at the bot and determines if they
+        are valid commands. If so, then acts on the commands. If not,
+        returns back what it needs for clarification.
     """
-    # Default response is help text for the user
-    default_response = "Not sure what you mean. Try *{}*.".format(EXAMPLE_COMMAND)
+    names = [word for word in command.split() if word.startswith('<@')]
+    name_list=[]
+    for name in names:
+        ans = slack_client.api_call("users.info",user = name.strip('<').strip('>').strip('@').upper())
+        print ans
+        name_list.append(ans['user']['profile']['first_name']+' '+ans['user']['profile']['last_name'])
 
-    # Finds and executes the given command, filling in response
-    response = None
-    # This is where you start to implement more commands!
-    if command.startswith(EXAMPLE_COMMAND):
-        response = "Sure...write some more code then I can do that!"
+    command = command.replace(" ", "")
 
-    # Sends the response back to the channel
-    slack_client.api_call(
-        "chat.postMessage",
-        channel=channel,
-        text=response or default_response
-    )
+    result = ""
+    response = "Sorry. I do not understand..!!"
+    command = command.lower()
+    print len(command)
+    if(len(command) == 0):
+        response = "Just a reminder...\n"
+        for name in count:
+            result = result + name + " " +'`' + str(count[name])  +'`' + " "+ '\n'
+        for name in isExcused:
+            response += "\nImmunity for ";
+            for name in isExcused:
+                response += (name + " ")
+            response = response + '\n'
+    if command.startswith(EXAMPLE_COMMAND_EXCUSED):
+        response = "Yes sir, I will"
+        slack_client.api_call("chat.postMessage", channel=channel,text=response, as_user=True)
+        for name in name_list:
+            isExcused[name] = True;
+        return;
+    if command.endswith(EXAMPLE_COMMAND_EXCUSED):
+        response = "Haha..!! Let's double their count.."
+        slack_client.api_call("chat.postMessage", channel=channel,text=response, as_user=True)
+        for name in name_list:
+            if name in count:
+                count[name] = count[name] * 2;
+        return;
+    if command.startswith(EXAMPLE_COMMAND_NOTEXCUSED):
+        response = "Your immunity is over!"
+        slack_client.api_call("chat.postMessage", channel=channel,text=response, as_user=True)
+        for name in name_list:
+            del isExcused[name]
+        return;
+    
+    if command.endswith(EXAMPLE_COMMAND_GOT):
+        print name_list
+        for name in name_list:
+            if name in isExcused:
+                continue
+            if name in count:
+                count[name] = count[name] + 1
+            else:
+                count[name] = 1
+        response = ' '.join(name_list)
+        response += ( " .....Be early next time!")
+        
+        for name in count:
+            result = result + name + " " +'`' + str(count[name])  +'`' + " "+ '\n'
+        for name in isExcused:
+            response += "\nImmunity for ";
+            for name in isExcused:
+                response += (name + " ")
+            response = response + '\n'
+    else:
+        if command.endswith(EXAMPLE_COMMAND_GAVE):
+            for name in name_list:
+                count[name] = 0
+            response = ' '.join(name_list)
+            response += ( " Those chocolates were delicious. Thanks..!")
+            for name in count:
+                result = result + name + " " +'`' + str(count[name])  +'`' + " "+ '\n'
+
+    slack_client.api_call("chat.postMessage", channel=channel,
+                          text=response, as_user=True)
+    if len(result):
+        slack_client.api_call("chat.postMessage", channel=channel,text=result, as_user=True)
+    with open('chocolate_counter.csv', 'wb') as csv_file:
+        writer = csv.writer(csv_file)
+        for key, value in count.items():
+            writer.writerow([key, value])
+
+def parse_slack_output(slack_rtm_output):
+    """
+        The Slack Real Time Messaging API is an events firehose.
+        this parsing function returns None unless a message is
+        directed at the Bot, based on its ID.
+    """
+    output_list = slack_rtm_output
+    if output_list and len(output_list) > 0:
+        for output in output_list:
+            if output and 'text' in output and AT_BOT in output['text']:
+                # return text after the @ mention, whitespace removed
+                return output['text'].split(AT_BOT)[1].strip().lower(), \
+                       output['channel']
+    return None, None
+
 
 if __name__ == "__main__":
-    if slack_client.rtm_connect(with_team_state=False):
-        print("Starter Bot connected and running!")
-        # Read bot's user ID by calling Web API method `auth.test`
-        starterbot_id = slack_client.api_call("auth.test")["user_id"]
+    # Bind to PORT if defined, otherwise default to 5000.
+    READ_WEBSOCKET_DELAY = 1 # 1 second delay between reading from firehose
+    if slack_client.rtm_connect():
+        print("StarterBot connected and running!")
         while True:
-            command, channel = parse_bot_commands(slack_client.rtm_read())
-            if command:
+
+            # Read from csv to dictionary
+            with open('chocolate_counter.csv', 'rb') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    count[row[0]] = row[1]
+
+            command, channel = parse_slack_output(slack_client.rtm_read())
+            if channel:
                 handle_command(command, channel)
-            time.sleep(RTM_READ_DELAY)
+            time.sleep(READ_WEBSOCKET_DELAY)
     else:
-        print("Connection failed. Exception traceback printed above.")
+        print("Connection failed. Invalid Slack token or bot ID?")
